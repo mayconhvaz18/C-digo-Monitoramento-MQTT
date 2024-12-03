@@ -1,0 +1,281 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "DHT.h"
+#include <Wire.h>
+#include <Adafruit_MAX6675.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// Configurações Wi-Fi e MQTT
+const char* ssid = "DESKTOP";
+const char* password = "12345678";
+const char* mqtt_server = "test.mosquitto.org"; // Servidor MQTT Mosquitto
+const int mqtt_port = 1883; // Porta padrão MQTT
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Configurações do sensor DHT22
+#define DHTPIN 23
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// Configurações do sensor de tensão AC
+int sensorTensaoAC = 33;
+float valorTensao;
+int novaAmostragem = 500;
+float mediaTotal = 0;
+float valorFinal = 0;
+float voltsporUnidade = 3.3 / 4095.0;
+
+// Configurações do sensor de temperatura MAX31855
+int ktcSO = 19;
+int ktcCS = 5;
+int ktcCLK = 18;
+Adafruit_MAX31855 ktc(ktcCLK, ktcCS, ktcSO);
+
+// Configurações do acelerômetro/giroscópio MPU6050
+Adafruit_MPU6050 mpu;
+
+// Pinos dos LEDs de Status
+const int ledWiFiVerde = 2;
+const int ledWiFiAmarelo = 15;
+const int ledWiFiVermelho = 4;
+const int ledMQTTVerde = 27;
+const int ledMQTTAmarelo = 26;
+const int ledMQTTVermelho = 25;
+
+// Variáveis para controlar o tempo entre leituras dos sensores
+unsigned long tempoAtual;
+unsigned long intervaloDHT = 1000;
+unsigned long intervaloTensao = 1000;
+unsigned long intervaloMAX31855 = 1000;
+unsigned long intervaloMPU = 1000;
+
+unsigned long ultimoTempoDHT = 0;
+unsigned long ultimoTempoTensao = 0;
+unsigned long ultimoTempoMAX31855 = 0;
+unsigned long ultimoTempoMPU = 0;
+
+unsigned long intervaloReconexaoMQTT = 5000;
+unsigned long ultimoTempoReconexaoMQTT = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ledWiFiVerde, OUTPUT);
+  pinMode(ledWiFiAmarelo, OUTPUT);
+  pinMode(ledWiFiVermelho, OUTPUT);
+  pinMode(ledMQTTVerde, OUTPUT);
+  pinMode(ledMQTTAmarelo, OUTPUT);
+  pinMode(ledMQTTVermelho, OUTPUT);
+
+  digitalWrite(ledWiFiVerde, LOW);
+  digitalWrite(ledWiFiAmarelo, LOW);
+  digitalWrite(ledWiFiVermelho, LOW);
+  digitalWrite(ledMQTTVerde, LOW);
+  digitalWrite(ledMQTTAmarelo, LOW);
+  digitalWrite(ledMQTTVermelho, LOW);
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+
+  dht.begin();
+  pinMode(sensorTensaoAC, INPUT);
+
+  if (!ktc.begin()) {
+    Serial.println("Falha na inicialização do sensor MAX31855!");
+    while (1);
+  }
+
+  if (!mpu.begin()) {
+    Serial.println("Falha ao conectar o módulo MPU6050!");
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+}
+
+void loop() {
+  tempoAtual = millis();
+
+  if (!client.connected()) {
+    updateMQTTLEDs(LOW, HIGH, LOW);
+    reconnect();
+  } else {
+    updateMQTTLEDs(HIGH, LOW, LOW);
+  }
+  client.loop();
+
+  if (tempoAtual - ultimoTempoReconexaoMQTT >= intervaloReconexaoMQTT) {
+    ultimoTempoReconexaoMQTT = tempoAtual;
+    if (!client.connected()) {
+      updateMQTTLEDs(LOW, HIGH, LOW);
+      reconnect();
+    }
+  }
+
+  // Leitura do DHT22
+  if (tempoAtual - ultimoTempoDHT >= intervaloDHT) {
+    ultimoTempoDHT = tempoAtual;
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    static float lastH = 0.0;
+    static float lastT = 0.0;
+
+    if (!isnan(h) && abs(h - lastH) > 0.5) {
+      String payloadHumidade = String(h);
+      client.publish("sensor/dht22/humidity", payloadHumidade.c_str());
+      lastH = h;
+    }
+
+    if (!isnan(t) && abs(t - lastT) > 0.5) {
+      String payloadTemperatura = String(t);
+      client.publish("sensor/dht22/temperature", payloadTemperatura.c_str());
+      lastT = t;
+    }
+  }
+
+  // Leitura da tensão AC
+  if (tempoAtual - ultimoTempoTensao >= intervaloTensao) {
+    ultimoTempoTensao = tempoAtual;
+
+    valorFinal = 0;
+    mediaTotal = 0;
+
+    for (int i = 0; i < novaAmostragem; i++) {
+      valorTensao = analogRead(sensorTensaoAC);
+      mediaTotal += valorTensao;
+    }
+    mediaTotal /= novaAmostragem;
+
+    if ((mediaTotal > 1000) && (mediaTotal < 1940)) {
+      valorFinal = ((mediaTotal * 3.3) / 4095) * 79.0;
+    } else if ((mediaTotal > 2650) && (mediaTotal < 4095)) {
+      valorFinal = ((mediaTotal * 3.3) / 4095) * 74.5;
+    }
+
+    static float lastVolt = 0.0;
+
+    if (abs(valorFinal - lastVolt) > 0.5) {
+      String payloadTensao = String(valorFinal);
+      client.publish("sensor/tensaoAC", payloadTensao.c_str());
+      lastVolt = valorFinal;
+    }
+  }
+
+  // Leitura do sensor MAX31855
+  if (tempoAtual - ultimoTempoMAX31855 >= intervaloMAX31855) {
+    ultimoTempoMAX31855 = tempoAtual;
+
+    double tempC = ktc.readCelsius();
+    static double lastTempC = 0.0;
+
+    if (!isnan(tempC) && abs(tempC - lastTempC) > 0.5) {
+      String payloadMAX31855 = String(tempC);
+      client.publish("sensor/max31855", payloadMAX31855.c_str());
+      lastTempC = tempC;
+    }
+  }
+
+  // Leitura do MPU6050
+  if (tempoAtual - ultimoTempoMPU >= intervaloMPU) {
+    ultimoTempoMPU = tempoAtual;
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    // Publicação dos valores de aceleração
+    String payloadAccX = String(a.acceleration.x);
+    client.publish("sensor/mpu6050/acceleration_x", payloadAccX.c_str());
+
+    String payloadAccY = String(a.acceleration.y);
+    client.publish("sensor/mpu6050/acceleration_y", payloadAccY.c_str());
+
+    String payloadAccZ = String(a.acceleration.z);
+    client.publish("sensor/mpu6050/acceleration_z", payloadAccZ.c_str());
+
+    // Publicação dos valores de giroscópio
+    String payloadGyroX = String(g.gyro.x);
+    client.publish("sensor/mpu6050/gyro_x", payloadGyroX.c_str());
+
+    String payloadGyroY = String(g.gyro.y);
+    client.publish("sensor/mpu6050/gyro_y", payloadGyroY.c_str());
+
+    String payloadGyroZ = String(g.gyro.z);
+    client.publish("sensor/mpu6050/gyro_z", payloadGyroZ.c_str());
+
+    // Publicação da temperatura do MPU6050
+    String payloadTempMPU = String(temp.temperature);
+    client.publish("sensor/mpu6050/temperature", payloadTempMPU.c_str());
+  }
+}
+
+// Função para configurar a conexão Wi-Fi
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Conectando a ");
+  Serial.println(ssid);
+
+  updateWiFiLEDs(LOW, HIGH, LOW);
+
+  WiFi.begin(ssid, password);
+
+  int max_attempts = 20;
+  int attempt = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempt < max_attempts) {
+    delay(500);
+    Serial.print(".");
+    attempt++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi conectado");
+    Serial.print("Endereço IP: ");
+    Serial.println(WiFi.localIP());
+    updateWiFiLEDs(HIGH, LOW, LOW);
+  } else {
+    Serial.println("");
+    Serial.println("Falha ao conectar WiFi");
+    updateWiFiLEDs(LOW, LOW, HIGH);
+  }
+}
+
+// Função para reconectar ao broker MQTT
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Tentando conexão MQTT...");
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str())) {
+      Serial.println("Conectado");
+      updateMQTTLEDs(HIGH, LOW, LOW);
+    } else {
+      Serial.print("Falha, rc=");
+      Serial.print(client.state());
+      Serial.println(" Tentando novamente em 5 segundos");
+      updateMQTTLEDs(LOW, HIGH, LOW);
+      delay(5000);
+    }
+  }
+}
+
+// Funções para atualizar os LEDs de status
+void updateWiFiLEDs(int verde, int amarelo, int vermelho) {
+  digitalWrite(ledWiFiVerde, verde);
+  digitalWrite(ledWiFiAmarelo, amarelo);
+  digitalWrite(ledWiFiVermelho, vermelho);
+}
+
+void updateMQTTLEDs(int verde, int amarelo, int vermelho) {
+  digitalWrite(ledMQTTVerde, verde);
+  digitalWrite(ledMQTTAmarelo, amarelo);
+  digitalWrite(ledMQTTVermelho, vermelho);
+}
+
